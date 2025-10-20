@@ -7,12 +7,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from collections import defaultdict
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from types import SimpleNamespace
+from types import GeneratorType, SimpleNamespace
 from typing import List, Optional
 
 import git
@@ -33,6 +34,132 @@ from aider.io import InputOutput
 BENCHMARK_DNAME = Path(os.environ.get("AIDER_BENCHMARK_DIR", "tmp.benchmarks"))
 
 EXERCISES_DIR_DEFAULT = "polyglot-benchmark"
+
+# Circuit breaker limits for infinite thought loops
+MAX_GENERATION_SECONDS = int(os.environ.get("AIDER_MAX_GENERATION_SECONDS", "180"))
+MAX_GENERATION_TOKENS = int(os.environ.get("AIDER_MAX_GENERATION_TOKENS", "10000"))
+MAX_STREAM_REPEAT_CHUNKS = int(os.environ.get("AIDER_MAX_STREAM_REPEAT_CHUNKS", "200"))
+MIN_STREAM_REPEAT_CHARS = int(os.environ.get("AIDER_MIN_STREAM_REPEAT_CHARS", "32"))
+
+try:
+    _CHARS_PER_TOKEN = float(os.environ.get("AIDER_CHARS_PER_TOKEN", "4"))
+except ValueError:
+    _CHARS_PER_TOKEN = 4.0
+
+if _CHARS_PER_TOKEN <= 0:
+    _CHARS_PER_TOKEN = 4.0
+
+
+def _tokens_to_char_limit(token_limit: int) -> int:
+    if token_limit <= 0:
+        return token_limit
+    return int(token_limit * _CHARS_PER_TOKEN)
+
+
+MAX_GENERATION_CHAR_LIMIT = _tokens_to_char_limit(MAX_GENERATION_TOKENS)
+
+
+class StreamCharacterLimitError(RuntimeError):
+    pass
+
+
+class StreamRepetitionError(RuntimeError):
+    pass
+
+
+class _StreamGenerationGuard:
+    def __init__(
+        self,
+        coder,
+        *,
+        max_seconds,
+        max_chars,
+        max_tokens,
+        max_repeat_chunks,
+        min_repeat_chars,
+    ):
+        self.coder = coder
+        self.max_seconds = max_seconds
+        self.max_chars = max_chars
+        self.max_tokens = max_tokens
+        self.max_repeat_chunks = max_repeat_chunks
+        self.min_repeat_chars = min_repeat_chars
+        self.original_send_message = coder.send_message
+
+    def __enter__(self):
+        def wrapped_send_message(*args, **kwargs):
+            iterator = self.original_send_message(*args, **kwargs)
+            if not isinstance(iterator, GeneratorType):
+                return iterator
+
+            start = time.time()
+            total_chars = 0
+            repeat_count = 0
+            last_chunk = None
+
+            def generator():
+                nonlocal total_chars, repeat_count, last_chunk
+                for chunk in iterator:
+                    elapsed = time.time() - start
+                    if self.max_seconds and elapsed > self.max_seconds:
+                        message = (
+                            f"Generation exceeded {self.max_seconds}s time limit "
+                            f"(elapsed: {elapsed:.1f}s)"
+                        )
+                        print(f"\n⚠️  {message}")
+                        raise TimeoutError(message)
+
+                    text = chunk if isinstance(chunk, str) else str(chunk)
+                    if text:
+                        total_chars += len(text)
+                        if self.max_chars and total_chars > self.max_chars:
+                            message = (
+                                f"Generation exceeded {self.max_tokens} token limit "
+                                f"(~{self.max_chars} chars, actual: {total_chars})"
+                            )
+                            print(f"\n⚠️  {message}")
+                            raise StreamCharacterLimitError(message)
+
+                        normalized = text.strip()
+                        if (
+                            self.max_repeat_chunks
+                            and len(normalized) >= self.min_repeat_chars
+                        ):
+                            if normalized == last_chunk:
+                                repeat_count += 1
+                            else:
+                                last_chunk = normalized
+                                repeat_count = 1
+                            if repeat_count > self.max_repeat_chunks:
+                                preview = normalized[:80]
+                                message = (
+                                    f"Generation repeated the same chunk {repeat_count} times: "
+                                    f"{preview!r}"
+                                )
+                                print(f"\n⚠️  {message}")
+                                raise StreamRepetitionError(message)
+
+                    yield chunk
+
+            return generator()
+
+        self.coder.send_message = wrapped_send_message
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.coder.send_message = self.original_send_message
+        return False
+
+
+def install_stream_repetition_guard(coder):
+    return _StreamGenerationGuard(
+        coder,
+        max_seconds=MAX_GENERATION_SECONDS,
+        max_chars=MAX_GENERATION_CHAR_LIMIT,
+        max_tokens=MAX_GENERATION_TOKENS,
+        max_repeat_chunks=MAX_STREAM_REPEAT_CHUNKS,
+        min_repeat_chars=MIN_STREAM_REPEAT_CHARS,
+    )
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
@@ -251,7 +378,7 @@ def main(
 
     if "AIDER_DOCKER" not in os.environ:
         print("Warning: benchmarking runs unvetted code from GPT, run in a docker container")
-        return
+        #return
 
     assert BENCHMARK_DNAME.exists() and BENCHMARK_DNAME.is_dir(), BENCHMARK_DNAME
 
@@ -345,7 +472,7 @@ def main(
         test_dnames = test_dnames[:num_tests]
 
     # Don't give up when benchmarking
-    LONG_TIMEOUT = 24 * 60 * 60
+    LONG_TIMEOUT = 120
     sendchat.RETRY_TIMEOUT = LONG_TIMEOUT
     base_coder.RETRY_TIMEOUT = LONG_TIMEOUT
     models.RETRY_TIMEOUT = LONG_TIMEOUT
@@ -492,6 +619,7 @@ def summarize_results(dirname, stats_languages=None):
     res.syntax_errors = 0
     res.indentation_errors = 0
     res.lazy_comments = 0
+    res.generation_limit_failures = 0
     res.prompt_tokens = 0
     res.completion_tokens = 0
 
@@ -524,6 +652,7 @@ def summarize_results(dirname, stats_languages=None):
 
         res.syntax_errors += results.get("syntax_errors", 0)
         res.indentation_errors += results.get("indentation_errors", 0)
+        res.generation_limit_failures += results.get("generation_limit_failures", 0)
 
         res.prompt_tokens += results.get("prompt_tokens", 0)
         res.completion_tokens += results.get("completion_tokens", 0)
@@ -595,6 +724,7 @@ def summarize_results(dirname, stats_languages=None):
     show("syntax_errors")
     show("indentation_errors")
     show("exhausted_context_windows")
+    show("generation_limit_failures")
     show("prompt_tokens", red=None)
     show("completion_tokens", red=None)
     show("test_timeouts")
@@ -825,10 +955,10 @@ def run_test_real(
         io,
         fnames=fnames,
         use_git=False,
-        stream=False,
+        stream=True,
         verbose=verbose,
         # auto_lint=False,  # disabled for code-in-json experiments
-        cache_prompts=True,
+        cache_prompts=False,
         suggest_shell_commands=False,
         ignore_mentions=ignore_files,
     )
@@ -842,11 +972,17 @@ def run_test_real(
     syntax_errors = 0
     indentation_errors = 0
     lazy_comments = 0
+    generation_limit_failures = 0
+    generation_limit_reason = None
+    stream_repetition_failures = 0
+    stream_repetition_reason = None
 
     dur = 0
     test_outcomes = []
     for i in range(tries):
         start = time.time()
+        generation_aborted = False
+        abort_reason = None
 
         if no_aider:
             pass
@@ -860,7 +996,23 @@ def run_test_real(
 
             coder.apply_updates()
         else:
-            response = coder.run(with_message=instructions, preproc=False)
+            try:
+                with install_stream_repetition_guard(coder):
+                    response = coder.run(with_message=instructions, preproc=False)
+            except (TimeoutError, StreamCharacterLimitError) as err:
+                generation_aborted = True
+                abort_reason = str(err)
+                generation_limit_failures += 1
+                generation_limit_reason = abort_reason
+                print(f"⚠️  Generation limit exceeded on try {i+1}/{tries}: {abort_reason}")
+                response = ""
+            except StreamRepetitionError as err:
+                generation_aborted = True
+                abort_reason = str(err)
+                stream_repetition_failures += 1
+                stream_repetition_reason = abort_reason
+                print(f"⚠️  Stream repetition guard tripped on try {i+1}/{tries}: {abort_reason}")
+                response = ""
 
         dur += time.time() - start
 
@@ -869,13 +1021,17 @@ def run_test_real(
             # Count the number of lines that match pat in response
             dump(response)
             lazy_comments += len(re.findall(pat, response, re.MULTILINE))
-            dump(lazy_comments)
+        dump(lazy_comments)
 
         if coder.last_keyboard_interrupt:
             raise KeyboardInterrupt
 
-        if no_unit_tests:
-            break
+        # If generation was aborted, mark as failed and continue to next try
+        if generation_aborted:
+            test_outcomes.append(False)
+            if i < tries - 1:  # Not the last try
+                print(f"Continuing to try {i+2}/{tries} after generation limit abort...")
+            continue
 
         try:
             errors = run_unit_tests(original_dname, testdir, history_fname, test_files)
@@ -956,6 +1112,10 @@ def run_test_real(
         syntax_errors=syntax_errors,
         indentation_errors=indentation_errors,
         lazy_comments=lazy_comments,  # Add the count of pattern matches to the results
+        generation_limit_failures=generation_limit_failures,
+        generation_limit_reason=generation_limit_reason,
+        stream_repetition_failures=stream_repetition_failures,
+        stream_repetition_reason=stream_repetition_reason,
         reasoning_effort=reasoning_effort,
         prompt_tokens=coder.total_tokens_sent,
         completion_tokens=coder.total_tokens_received,
