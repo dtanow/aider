@@ -41,6 +41,12 @@ MAX_GENERATION_TOKENS = int(os.environ.get("AIDER_MAX_GENERATION_TOKENS", "10000
 MAX_STREAM_REPEAT_CHUNKS = int(os.environ.get("AIDER_MAX_STREAM_REPEAT_CHUNKS", "200"))
 MIN_STREAM_REPEAT_CHARS = int(os.environ.get("AIDER_MIN_STREAM_REPEAT_CHARS", "32"))
 
+# Model temperature configuration
+try:
+    TEMPERATURE = float(os.environ.get("AIDER_TEMPERATURE", "0.0"))
+except ValueError:
+    TEMPERATURE = 0.0
+
 try:
     _CHARS_PER_TOKEN = float(os.environ.get("AIDER_CHARS_PER_TOKEN", "4"))
 except ValueError:
@@ -342,11 +348,19 @@ def main(
     exercises_dir: str = typer.Option(
         EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
     ),
+    stream: bool = typer.Option(
+        None, "--stream/--no-stream", help="Enable/disable streaming responses (default: from env AIDER_STREAMING or True)"
+    ),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
     if repo.is_dirty():
         commit_hash += "-dirty"
+
+    # Configure streaming: use parameter if provided, else environment variable, else True
+    if stream is None:
+        stream_env = os.environ.get("AIDER_STREAMING", "true").lower()
+        stream = stream_env in ("true", "1", "yes", "on")
 
     if stats_only and not dirnames:
         latest_dir = find_latest_benchmark_dir()
@@ -936,6 +950,12 @@ def run_test_real(
     if thinking_tokens is not None:
         main_model.set_thinking_tokens(thinking_tokens)
 
+    # Set temperature from environment variable if available
+    if TEMPERATURE is not None and TEMPERATURE >= 0:
+        main_model.use_temperature = TEMPERATURE
+        if verbose:
+            print(f"Using temperature: {TEMPERATURE}")
+
     dump(main_model.max_chat_history_tokens)
 
     if num_ctx:
@@ -955,7 +975,7 @@ def run_test_real(
         io,
         fnames=fnames,
         use_git=False,
-        stream=True,
+        stream=stream,
         verbose=verbose,
         # auto_lint=False,  # disabled for code-in-json experiments
         cache_prompts=False,
