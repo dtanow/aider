@@ -838,6 +838,7 @@ def run_test_real(
     reasoning_effort: Optional[str] = None,
     thinking_tokens: Optional[int] = None,
     read_model_settings=None,
+    stream=True,
 ):
     if not os.path.isdir(testdir):
         print("Not a dir:", testdir)
